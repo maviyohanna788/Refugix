@@ -15,6 +15,11 @@
 (define-constant ERR-INVALID-RELATIONSHIP (err u109))
 (define-constant ERR-SEARCH-NOT-FOUND (err u110))
 (define-constant ERR-INVALID-SEARCH-STATUS (err u111))
+(define-constant ERR-ALERT-NOT-FOUND (err u112))
+(define-constant ERR-ALREADY-RESPONDED (err u113))
+(define-constant ERR-INVALID-EMERGENCY-TYPE (err u114))
+(define-constant ERR-INVALID-PRIORITY (err u115))
+(define-constant ERR-RESPONSE-NOT-FOUND (err u116))
 
 (define-constant STATUS-PENDING u0)
 (define-constant STATUS-VERIFIED u1)
@@ -33,11 +38,31 @@
 (define-constant SEARCH-STATUS-FOUND u1)
 (define-constant SEARCH-STATUS-CLOSED u2)
 
+(define-constant EMERGENCY-MEDICAL u0)
+(define-constant EMERGENCY-SECURITY u1)
+(define-constant EMERGENCY-SHELTER u2)
+(define-constant EMERGENCY-FOOD u3)
+(define-constant EMERGENCY-WATER u4)
+(define-constant EMERGENCY-TRANSPORT u5)
+(define-constant EMERGENCY-OTHER u6)
+
+(define-constant PRIORITY-LOW u0)
+(define-constant PRIORITY-MEDIUM u1)
+(define-constant PRIORITY-HIGH u2)
+(define-constant PRIORITY-CRITICAL u3)
+
+(define-constant ALERT-STATUS-ACTIVE u0)
+(define-constant ALERT-STATUS-RESPONDING u1)
+(define-constant ALERT-STATUS-RESOLVED u2)
+(define-constant ALERT-STATUS-CLOSED u3)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-refugee-id uint u1)
 (define-data-var next-document-id uint u1)
 (define-data-var next-family-id uint u1)
 (define-data-var next-search-id uint u1)
+(define-data-var next-alert-id uint u1)
+(define-data-var next-response-id uint u1)
 
 (define-map refugees uint {
     owner: principal,
@@ -103,6 +128,33 @@
 
 (define-map refugee-family-connections uint (list 10 uint))
 (define-map refugee-active-searches uint (list 5 uint))
+
+(define-map emergency-alerts uint {
+    refugee-id: uint,
+    emergency-type: uint,
+    priority: uint,
+    location: (string-ascii 100),
+    description: (string-ascii 300),
+    contact-info: (string-ascii 100),
+    status: uint,
+    created-at: uint,
+    updated-at: uint,
+    response-count: uint
+})
+
+(define-map alert-responses uint {
+    alert-id: uint,
+    responder-id: uint,
+    responder-type: uint,
+    response-message: (string-ascii 200),
+    estimated-arrival: (optional uint),
+    contact-info: (string-ascii 100),
+    created-at: uint,
+    status: uint
+})
+
+(define-map refugee-emergency-alerts uint (list 10 uint))
+(define-map alert-response-list uint (list 20 uint))
 
 (define-public (register-refugee 
     (full-name (string-ascii 100))
@@ -465,3 +517,197 @@
                 (+ count u1)
                 count)
         count))
+
+(define-public (create-emergency-alert 
+    (emergency-type uint)
+    (priority uint)
+    (location (string-ascii 100))
+    (description (string-ascii 300))
+    (contact-info (string-ascii 100)))
+    (let (
+        (alert-id (var-get next-alert-id))
+        (refugee-id (unwrap! (map-get? principal-to-refugee tx-sender) ERR-NOT-FOUND))
+        (current-alerts (default-to (list) (map-get? refugee-emergency-alerts refugee-id)))
+        (current-height stacks-block-height))
+        (asserts! (or (is-eq emergency-type EMERGENCY-MEDICAL)
+                     (is-eq emergency-type EMERGENCY-SECURITY)
+                     (is-eq emergency-type EMERGENCY-SHELTER)
+                     (is-eq emergency-type EMERGENCY-FOOD)
+                     (is-eq emergency-type EMERGENCY-WATER)
+                     (is-eq emergency-type EMERGENCY-TRANSPORT)
+                     (is-eq emergency-type EMERGENCY-OTHER)) ERR-INVALID-EMERGENCY-TYPE)
+        (asserts! (or (is-eq priority PRIORITY-LOW)
+                     (is-eq priority PRIORITY-MEDIUM)
+                     (is-eq priority PRIORITY-HIGH)
+                     (is-eq priority PRIORITY-CRITICAL)) ERR-INVALID-PRIORITY)
+        (map-set emergency-alerts alert-id {
+            refugee-id: refugee-id,
+            emergency-type: emergency-type,
+            priority: priority,
+            location: location,
+            description: description,
+            contact-info: contact-info,
+            status: ALERT-STATUS-ACTIVE,
+            created-at: current-height,
+            updated-at: current-height,
+            response-count: u0
+        })
+        (map-set refugee-emergency-alerts refugee-id 
+            (unwrap! (as-max-len? (append current-alerts alert-id) u10) ERR-ALERT-NOT-FOUND))
+        (map-set alert-response-list alert-id (list))
+        (var-set next-alert-id (+ alert-id u1))
+        (ok alert-id)))
+
+(define-public (respond-to-alert 
+    (alert-id uint)
+    (responder-type uint)
+    (response-message (string-ascii 200))
+    (estimated-arrival (optional uint))
+    (contact-info (string-ascii 100)))
+    (let (
+        (response-id (var-get next-response-id))
+        (alert-data (unwrap! (map-get? emergency-alerts alert-id) ERR-ALERT-NOT-FOUND))
+        (responder-refugee-id (unwrap! (map-get? principal-to-refugee tx-sender) ERR-NOT-FOUND))
+        (current-responses (default-to (list) (map-get? alert-response-list alert-id)))
+        (current-height stacks-block-height))
+        (asserts! (is-eq (get status alert-data) ALERT-STATUS-ACTIVE) ERR-INVALID-STATUS)
+        (map-set alert-responses response-id {
+            alert-id: alert-id,
+            responder-id: responder-refugee-id,
+            responder-type: responder-type,
+            response-message: response-message,
+            estimated-arrival: estimated-arrival,
+            contact-info: contact-info,
+            created-at: current-height,
+            status: ALERT-STATUS-ACTIVE
+        })
+        (map-set alert-response-list alert-id 
+            (unwrap! (as-max-len? (append current-responses response-id) u20) ERR-ALREADY-RESPONDED))
+        (map-set emergency-alerts alert-id (merge alert-data {
+            response-count: (+ (get response-count alert-data) u1),
+            status: ALERT-STATUS-RESPONDING,
+            updated-at: current-height
+        }))
+        (var-set next-response-id (+ response-id u1))
+        (ok response-id)))
+
+(define-public (update-alert-status (alert-id uint) (new-status uint))
+    (let (
+        (alert-data (unwrap! (map-get? emergency-alerts alert-id) ERR-ALERT-NOT-FOUND))
+        (refugee-id (unwrap! (map-get? principal-to-refugee tx-sender) ERR-NOT-FOUND))
+        (current-height stacks-block-height))
+        (asserts! (is-eq refugee-id (get refugee-id alert-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (or (is-eq new-status ALERT-STATUS-ACTIVE)
+                     (is-eq new-status ALERT-STATUS-RESPONDING)
+                     (is-eq new-status ALERT-STATUS-RESOLVED)
+                     (is-eq new-status ALERT-STATUS-CLOSED)) ERR-INVALID-STATUS)
+        (map-set emergency-alerts alert-id (merge alert-data {
+            status: new-status,
+            updated-at: current-height
+        }))
+        (ok true)))
+
+(define-public (close-expired-alerts-batch (alert-ids (list 10 uint)))
+    (let (
+        (verifier-data (unwrap! (map-get? verifiers tx-sender) ERR-INVALID-VERIFIER))
+        (current-height stacks-block-height))
+        (asserts! (get authorized verifier-data) ERR-NOT-AUTHORIZED)
+        (fold close-single-alert alert-ids u0)
+        (ok true)))
+
+(define-private (close-single-alert (alert-id uint) (processed uint))
+    (let (
+        (alert-data (default-to 
+            {refugee-id: u0, emergency-type: u0, priority: u0, location: "", description: "", 
+             contact-info: "", status: u0, created-at: u0, updated-at: u0, response-count: u0}
+            (map-get? emergency-alerts alert-id)))
+        (current-height stacks-block-height)
+        (alert-age (- current-height (get created-at alert-data))))
+        (if (and (> alert-age u144) (is-eq (get status alert-data) ALERT-STATUS-ACTIVE))
+            (begin
+                (map-set emergency-alerts alert-id (merge alert-data {
+                    status: ALERT-STATUS-CLOSED,
+                    updated-at: current-height
+                }))
+                (+ processed u1))
+            processed)))
+
+(define-read-only (get-emergency-alert (alert-id uint))
+    (map-get? emergency-alerts alert-id))
+
+(define-read-only (get-alert-response (response-id uint))
+    (map-get? alert-responses response-id))
+
+(define-read-only (get-refugee-emergency-alerts (refugee-id uint))
+    (map-get? refugee-emergency-alerts refugee-id))
+
+(define-read-only (get-alert-responses (alert-id uint))
+    (map-get? alert-response-list alert-id))
+
+(define-read-only (get-next-alert-id)
+    (var-get next-alert-id))
+
+(define-read-only (get-next-response-id)
+    (var-get next-response-id))
+
+(define-read-only (is-alert-active (alert-id uint))
+    (match (map-get? emergency-alerts alert-id)
+        alert-data (is-eq (get status alert-data) ALERT-STATUS-ACTIVE)
+        false))
+
+(define-read-only (get-high-priority-alerts)
+    (let ((fixed-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (fold get-high-priority-helper fixed-list (list))))
+
+(define-private (get-high-priority-helper (alert-id uint) (matches (list 50 uint)))
+    (match (map-get? emergency-alerts alert-id)
+        alert-data 
+            (if (and (is-eq (get status alert-data) ALERT-STATUS-ACTIVE)
+                    (or (is-eq (get priority alert-data) PRIORITY-HIGH)
+                        (is-eq (get priority alert-data) PRIORITY-CRITICAL)))
+                (unwrap-panic (as-max-len? (append matches alert-id) u50))
+                matches)
+        matches))
+
+(define-read-only (count-active-alerts)
+    (let ((fixed-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (fold count-active-alerts-helper fixed-list u0)))
+
+(define-private (count-active-alerts-helper (alert-id uint) (count uint))
+    (match (map-get? emergency-alerts alert-id)
+        alert-data 
+            (if (is-eq (get status alert-data) ALERT-STATUS-ACTIVE)
+                (+ count u1)
+                count)
+        count))
+
+(define-read-only (get-medical-alerts)
+    (let ((fixed-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (fold get-medical-alerts-helper fixed-list (list))))
+
+(define-private (get-medical-alerts-helper (alert-id uint) (matches (list 50 uint)))
+    (match (map-get? emergency-alerts alert-id)
+        alert-data 
+            (if (and (is-eq (get status alert-data) ALERT-STATUS-ACTIVE)
+                    (is-eq (get emergency-type alert-data) EMERGENCY-MEDICAL))
+                (unwrap-panic (as-max-len? (append matches alert-id) u50))
+                matches)
+        matches))
+
+(define-read-only (get-alert-statistics)
+    (let ((fixed-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (fold calculate-alert-stats fixed-list 
+            {total: u0, active: u0, resolved: u0, critical: u0})))
+
+(define-private (calculate-alert-stats (alert-id uint) (stats {total: uint, active: uint, resolved: uint, critical: uint}))
+    (match (map-get? emergency-alerts alert-id)
+        alert-data 
+            {total: (+ (get total stats) u1),
+             active: (+ (get active stats) (if (is-eq (get status alert-data) ALERT-STATUS-ACTIVE) u1 u0)),
+             resolved: (+ (get resolved stats) (if (is-eq (get status alert-data) ALERT-STATUS-RESOLVED) u1 u0)),
+             critical: (+ (get critical stats) (if (is-eq (get priority alert-data) PRIORITY-CRITICAL) u1 u0))}
+        stats))
+
+
+
+
